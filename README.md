@@ -61,6 +61,23 @@ Process a single image with depth estimation and basic 3D reconstruction:
 pixi run python tools/run_single_img.py --image-path data/office/IMG_4029.jpg
 ```
 
+By default, the single-image pipeline exports a 3D Gaussian Splat (3DGS) scene as a PLY file:
+
+- Raw PLY: `data/test_dir/gf.ply`
+- Optional compressed PLY (if `splat-transform` is available): `data/test_dir/gf.compressed.ply`
+
+You can override the output path:
+
+```bash
+pixi run python tools/run_single_img.py --image-path data/office/IMG_4029.jpg --export-gaussians-ply-path tmp/office_gs.ply
+```
+
+Or disable exporting entirely:
+
+```bash
+pixi run python tools/run_single_img.py --image-path data/office/IMG_4029.jpg --export-gaussians False
+```
+
 ### Flux Outpainting Only
 Run just the outpainting component with Rerun visualization:
 
@@ -80,6 +97,79 @@ Connect to an already running Rerun viewer (instead of spawning a new one):
 ```bash
 pixi run python tools/run_multi_img.py --rr-config.connect --image-dir /path/to/image_folder
 ```
+
+### Rerun over Remote-SSH (Headless Linux)
+
+If you run the pipelines on a remote machine without a GUI (no `DISPLAY`/Wayland), Rerun cannot spawn the native viewer.
+
+VistaDream will automatically fall back to serving logs over gRPC (default port `9876`). Then you can connect a local Rerun viewer over an SSH port-forward.
+
+Example:
+
+1) Start the pipeline on the remote host (over SSH / VSCode Remote):
+
+```bash
+pixi run python tools/run_single_img.py --image-path data/office/IMG_4029.jpg
+```
+
+2) Forward the gRPC port from local -> remote:
+
+```bash
+ssh -L 9876:127.0.0.1:9876 <user>@<remote-host>
+```
+
+3) On your local machine (with GUI), connect the viewer:
+
+```bash
+rerun --connect rerun+http://127.0.0.1:9876/proxy
+```
+
+If the remote pipeline finishes too quickly and exits before you connect, you can ask it to wait before exiting:
+
+```bash
+pixi run python tools/run_single_img.py --rr-config.wait --image-path data/office/IMG_4029.jpg
+```
+
+Or wait a fixed amount of time (seconds):
+
+```bash
+pixi run python tools/run_single_img.py --rr-config.wait-seconds 30 --image-path data/office/IMG_4029.jpg
+```
+
+### Reducing GPU Memory Usage (OOM)
+
+If you hit CUDA OOM, try one or more of:
+
+- Lower the maximum input resolution:
+
+```bash
+pixi run python tools/run_single_img.py --max-resolution 384 --image-path data/office/IMG_4029.jpg --stage fine
+```
+
+- Move the depth model (MoGe) to CPU as a fallback (slower but more stable):
+
+```bash
+pixi run python tools/run_single_img.py --depth-device cpu --max-resolution 384 --image-path data/office/IMG_4029.jpg --stage fine
+```
+
+- Reduce outpainting expansion (smaller latent = less VRAM):
+
+```bash
+pixi run python tools/run_single_img.py --expansion-percent 0.1 --image-path data/office/IMG_4029.jpg --stage fine
+```
+
+- Skip outpainting entirely (often the biggest VRAM saver):
+
+```bash
+pixi run python tools/run_single_img.py --image-path data/office/IMG_4029.jpg --stage no-outpaint
+```
+
+## my
+```bash
+ pixi run python tools/run_single_img.py --image-path data/office/IMG_4029.jpg --stage coarse --rr-config.wait --max-resolution 384
+```
+
+
 
 Notes:
 - Supported image extensions: .png, .jpg, .jpeg
@@ -129,10 +219,23 @@ pixi run python tools/gradio_app.py
 
 ## Model Checkpoints
 
-Models are automatically downloaded from Hugging Face on first run. Manual download:
+Models are automatically downloaded on first run:
+
+- Most checkpoints: Hugging Face Hub
+- `FLUX.1-Fill-dev` (flux fill): prefer ModelScope mirror when local files are missing (and fallback to Hugging Face if needed)
+
+Manual download (recommended, `FLUX.1-Fill-dev` from ModelScope, supports resume):
 
 ```bash
-pixi run huggingface-cli download pablovela5620/vistadream --local-dir ckpt/
+mkdir -p ckpt/flux_fill
+curl -L -C - -o ckpt/flux_fill/flux1-fill-dev.safetensors "https://modelscope.cn/models/AI-ModelScope/FLUX.1-Fill-dev/resolve/master/flux1-fill-dev.safetensors"
+curl -L -C - -o ckpt/flux_fill/ae.safetensors "https://modelscope.cn/models/AI-ModelScope/FLUX.1-Fill-dev/resolve/master/ae.safetensors"
+```
+
+Optional: download the full `ckpt/` snapshot from Hugging Face (can be less stable on some networks due to Xet storage).
+
+```bash
+HF_HUB_DISABLE_XET=1 pixi run hf download pablovela5620/vistadream --local-dir ckpt/
 ```
 
 Expected structure:

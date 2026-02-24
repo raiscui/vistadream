@@ -63,6 +63,9 @@ class FluxInpainting:
 
         if self.config.offload:
             self.ae = self.ae.cpu()
+            # 说明:
+            # - offload 模式下,我们会把 AE 放回 CPU 再把主模型搬到 GPU.
+            # - 在显存很紧张的场景里(例如只差几十 MiB 就 OOM),这里主动清空缓存可以减少碎片与峰值抖动.
             torch.cuda.empty_cache()
             self.model = self.model.to(self.torch_device)
 

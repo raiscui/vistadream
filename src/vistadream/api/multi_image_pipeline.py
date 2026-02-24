@@ -25,8 +25,10 @@ from numpy import ndarray
 from scipy.spatial.transform import Rotation
 from simplecv.camera_parameters import Extrinsics
 from simplecv.ops.conventions import CameraConventions, convert_pose
-from simplecv.rerun_log_utils import RerunTyroConfig, log_pinhole
+from simplecv.rerun_log_utils import log_pinhole
 from tqdm.auto import trange
+
+from vistadream.rerun_setup import VistaRerunConfig, init_rerun_from_config, maybe_wait_after_run
 
 np.set_printoptions(suppress=True)
 
@@ -316,7 +318,7 @@ def orient_mv_pred_list(
 
 @dataclass
 class VGGTInferenceConfig:
-    rr_config: RerunTyroConfig
+    rr_config: VistaRerunConfig
     image_dir: Path
     """Directory containing input images."""
     keep_top_percent: int | float = 50.0
@@ -453,7 +455,13 @@ def run_inference(config: VGGTInferenceConfig) -> None:
     bgr_list: list[UInt8[ndarray, "H W 3"]] = [cv2.imread(str(image_path)) for image_path in image_paths]
     rgb_list: list[UInt8[ndarray, "H W 3"]] = [cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB) for bgr in bgr_list]
 
-    # initialize rerun
+    # 显式初始化 rerun,避免隐式 init 在无 GUI 环境里触发 spawn viewer 导致 winit 报错.
+    server_uri: str | None = init_rerun_from_config(config.rr_config)
+    if server_uri is not None:
+        print(f"[INFO] Rerun gRPC server: {server_uri}")
+        print(f"[INFO] 你可以在本机(有 GUI 的那台机器)执行: rerun --connect {server_uri}")
+
+    # initialize rerun blueprint
     parent_log_path = Path("world")
     blueprint = create_blueprint(parent_log_path=parent_log_path, image_paths=image_paths)
     rr.send_blueprint(blueprint=blueprint)
@@ -634,3 +642,4 @@ def run_inference(config: VGGTInferenceConfig) -> None:
             ],
         )
     print(f"Inference completed in {timer() - start:.2f} seconds")
+    maybe_wait_after_run(config.rr_config, server_uri)

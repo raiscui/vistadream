@@ -15,10 +15,11 @@ from monopriors.relative_depth_models import (
 from monopriors.relative_depth_models.base_relative_depth import BaseRelativePredictor
 from PIL import Image
 from simplecv.camera_parameters import Extrinsics, Intrinsics, PinholeParameters
-from simplecv.rerun_log_utils import RerunTyroConfig, log_pinhole
+from simplecv.rerun_log_utils import log_pinhole
 
 from vistadream.ops.flux import FluxInpainting, FluxInpaintingConfig
 from vistadream.resize_utils import add_border_and_mask, process_image
+from vistadream.rerun_setup import VistaRerunConfig, init_rerun_from_config, maybe_wait_after_run
 
 
 @dataclass
@@ -27,7 +28,7 @@ class FluxOutpaintingConfig:
     Configuration for Flux Outpainting.
     """
 
-    rr_config: RerunTyroConfig
+    rr_config: VistaRerunConfig
     image_path: Path
     offload: bool = True
     num_steps: int = 25
@@ -39,6 +40,12 @@ def main(config: FluxOutpaintingConfig) -> None:
     """
     Main function to run the Flux Outpainting process.
     """
+    # 显式初始化 rerun,避免隐式 init 在无 GUI 环境里触发 spawn viewer 导致 winit 报错.
+    server_uri: str | None = init_rerun_from_config(config.rr_config)
+    if server_uri is not None:
+        print(f"[INFO] Rerun gRPC server: {server_uri}")
+        print(f"[INFO] 你可以在本机(有 GUI 的那台机器)执行: rerun --connect {server_uri}")
+
     parent_log_path: Path = Path("/world")
     cam_log_path: Path = parent_log_path / "camera"
     pinhole_path: Path = cam_log_path / "pinhole"
@@ -133,3 +140,5 @@ def main(config: FluxOutpaintingConfig) -> None:
             colors=rgb_hw3.reshape(-1, 3),
         ),
     )
+
+    maybe_wait_after_run(config.rr_config, server_uri)

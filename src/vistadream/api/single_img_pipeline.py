@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from timeit import default_timer as timer
 from typing import Literal
+import gc
 
 import numpy as np
 import rerun as rr
@@ -19,7 +20,7 @@ from monopriors.relative_depth_models import (
 from monopriors.relative_depth_models.base_relative_depth import BaseRelativePredictor
 from PIL import Image
 from simplecv.camera_parameters import Extrinsics, Intrinsics, PinholeParameters
-from simplecv.rerun_log_utils import RerunTyroConfig, log_pinhole
+from simplecv.rerun_log_utils import log_pinhole
 
 from vistadream.ops.connect import Smooth_Connect_Tool
 from vistadream.ops.flux import FluxInpainting, FluxInpaintingConfig
@@ -27,6 +28,7 @@ from vistadream.ops.gs.basic import Frame, Gaussian_Scene, save_ply
 from vistadream.ops.gs.train import GS_Train_Tool
 from vistadream.ops.trajs import _generate_trajectory
 from vistadream.resize_utils import add_border_and_mask, process_image
+from vistadream.rerun_setup import VistaRerunConfig, init_rerun_from_config, maybe_wait_after_run
 
 
 def log_frame(parent_log_path: Path, frame: Frame, cam_params: PinholeParameters, log_pcd: bool = False) -> None:
@@ -80,15 +82,28 @@ class SingleImageConfig:
     Configuration for Single Image Processing.
     """
 
-    rr_config: RerunTyroConfig
+    rr_config: VistaRerunConfig
     image_path: Path
     offload: bool = True
     num_steps: int = 25
     guidance: float = 30.0
     expansion_percent: float = 0.3
     n_frames: int = 10
-    max_resolution: Literal[512, 1024, 1920] = 512
+    # 说明:
+    # - 用于控制输入图片最大边长,越小越省显存.
+    # - 建议使用 32 的倍数,否则会在内部被向下对齐到 32 的倍数.
+    max_resolution: int = 512
+    # MoGe 深度模型的运行设备. 显存紧张时可以用 cpu 兜底(会显著变慢,但更稳).
+    depth_device: Literal["cuda", "cpu"] = "cuda"
     stage: Literal["no-outpaint", "outpaint", "coarse", "fine"] = "no-outpaint"
+    # 是否导出 3DGS 高斯点云(PLY). 默认开启,方便离线复用/调试.
+    export_gaussians: bool = True
+    # 导出 PLY 的目标路径.
+    # 说明:
+    # - 之前版本写死到 `data/test_dir/gf.ply`,用户不容易发现产物.
+    # - 这里保留同样的默认值,但允许通过 CLI 覆盖.
+    # - 如果你传的是目录(没有 .ply 后缀),会自动在目录下补上 `gf.ply`.
+    export_gaussians_ply_path: Path = Path("data/test_dir/gf.ply")
 
 
 def pose_to_frame(scene: Gaussian_Scene, cam_T_world: Float[np.ndarray, "4 4"], margin: int = 32) -> Frame:
@@ -139,12 +154,16 @@ class SingleImagePipeline:
         self.scene: Gaussian_Scene = Gaussian_Scene()
         if self.config.stage in ["outpaint", "coarse", "fine"]:
             self.flux_inpainter: FluxInpainting = FluxInpainting(FluxInpaintingConfig())
-        self.predictor: BaseRelativePredictor = get_relative_predictor("MogeV1Predictor")(device="cuda")
+        # 注意:
+        # - MoGe predictor 如果提前常驻在 GPU,可能导致 Flux 模型在 `to(cuda)` 时最后差一点显存就 OOM.
+        # - 因此这里改为“延迟加载”: 只有真正需要预测深度时才创建 predictor.
+        self.predictor: BaseRelativePredictor | None = None
         self.smooth_connector: Smooth_Connect_Tool = Smooth_Connect_Tool()
         # Initialize rerun with the provided configuration
         self.shared_intrinsics: Intrinsics | None = None
         self.image_plane_distance: float = 0.01
         self.logged_cam_idx_list: list[int] = []
+        self.rerun_server_uri: str | None = None
 
         # Detect image orientation early for blueprint configuration
         input_image: Image.Image = Image.open(self.config.image_path).convert("RGB")
@@ -160,15 +179,80 @@ class SingleImagePipeline:
         self.setup_rerun()
         # outpaint -> depth prediction -> scene generation
         self._initialize()
+        # 对于非 coarse 的阶段,初始化完成后就不再需要 MoGe/Flux 相关大模型了.
+        # 主动释放可以显著降低后续 GS 训练/渲染的峰值显存,减少 OOM 概率.
+        if self.config.stage != "coarse":
+            self._release_init_models()
         # generate the coarse scene
         if self.config.stage == "coarse":
             self._coarse()
-        # save the scene
-        save_dir: Path = Path("data/test_dir/")
-        gf_path: Path = save_dir / "gf.ply"
-        save_dir.mkdir(exist_ok=True, parents=True)
+
+        # 说明:
+        # - `_render_splats()` 负责把最终结果记录到 Rerun(便于交互查看).
+        # - PLY 导出是“离线产物”,很多用户更关心它落在哪里,因此这里显式打印路径.
         self._render_splats()
-        save_ply(self.scene, gf_path)
+
+        if not self.config.export_gaussians:
+            print("[INFO] export_gaussians=False, skip exporting Gaussian PLY.")
+            return
+
+        export_path: Path = self.config.export_gaussians_ply_path
+        # 兼容用户传目录的情况: `--export-gaussians-ply-path tmp/out_dir`
+        if export_path.suffix.lower() != ".ply":
+            export_path = export_path / "gf.ply"
+
+        export_path.parent.mkdir(exist_ok=True, parents=True)
+        print(f"[INFO] Exporting Gaussian splats to: {export_path}")
+        save_ply(self.scene, export_path)
+
+        # 如果压缩工具可用,`save_ply` 会额外生成 `*.compressed.ply`.
+        compressed_path: Path = export_path.parent / f"{export_path.stem}.compressed.ply"
+        if compressed_path.exists():
+            print(f"[INFO] Exported compressed Gaussian PLY to: {compressed_path}")
+
+    def _release_init_models(self) -> None:
+        """
+        释放初始化阶段使用的大模型,降低后续阶段的显存峰值.
+
+        说明:
+        - `stage=coarse` 还会继续用到 predictor/flux,因此不能释放.
+        - `stage=fine/outpaint/no-outpaint` 在 `_initialize` 之后就只用 GS 场景渲染/导出,可安全释放.
+        """
+        released_any: bool = False
+
+        if getattr(self, "predictor", None) is not None:
+            try:
+                del self.predictor
+                released_any = True
+            except Exception:
+                # 极端情况下 predictor 可能是第三方对象,del 失败也不应影响主流程.
+                pass
+
+        if hasattr(self, "flux_inpainter"):
+            try:
+                del self.flux_inpainter
+                released_any = True
+            except Exception:
+                pass
+
+        if released_any:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    def _get_predictor(self) -> BaseRelativePredictor:
+        """
+        延迟创建 MoGe predictor,避免和 Flux 模型争抢初始化阶段的峰值显存.
+        """
+        if self.predictor is not None:
+            return self.predictor
+
+        device: str = self.config.depth_device
+        if device == "cuda" and not torch.cuda.is_available():
+            device = "cpu"
+
+        self.predictor = get_relative_predictor("MogeV1Predictor")(device=device)
+        return self.predictor
 
     def _coarse(self):
         """
@@ -292,7 +376,8 @@ class SingleImagePipeline:
         frame.rgb = inpainted_rgb_hw3.astype(np.float32) / 255.0  # Convert to [0,1] range
 
         # Predict depth for the inpainted frame
-        depth_prediction: RelativeDepthPrediction = self.predictor.__call__(rgb=inpainted_rgb_hw3, K_33=frame.intrinsic)
+        predictor: BaseRelativePredictor = self._get_predictor()
+        depth_prediction: RelativeDepthPrediction = predictor.__call__(rgb=inpainted_rgb_hw3, K_33=frame.intrinsic)
         predicted_depth_hw: Float[np.ndarray, "H W"] = depth_prediction.depth
 
         # Remove any nans or infs and set them to 0
@@ -396,7 +481,13 @@ class SingleImagePipeline:
 
         input_image: Image.Image = Image.open(self.config.image_path).convert("RGB")
         # ensures image is correctly sized and processed
-        input_image: Image.Image = process_image(input_image, max_dimension=self.config.max_resolution)
+        # `process_image` 内部会处理缩放,但这里先把参数对齐到 32 的倍数,减少边界情况带来的显存抖动.
+        max_dimension: int = int(self.config.max_resolution)
+        if max_dimension <= 0:
+            max_dimension = 512
+        max_dimension = (max_dimension // 32) * 32
+        max_dimension = max(32, max_dimension)
+        input_image: Image.Image = process_image(input_image, max_dimension=max_dimension)
 
         if self.config.stage == "no-outpaint":
             # No outpainting, just use the input image directly
@@ -404,7 +495,8 @@ class SingleImagePipeline:
             outpaint_mask: Image.Image = Image.new("L", input_image.size, 0)
             # Just use the input image for depth prediction since there's no outpainting
             outpaint_rgb_hw3: UInt8[np.ndarray, "H W 3"] = np.array(outpaint_img.convert("RGB"))
-            outpaint_rel_depth: RelativeDepthPrediction = self.predictor.__call__(rgb=outpaint_rgb_hw3, K_33=None)
+            predictor: BaseRelativePredictor = self._get_predictor()
+            outpaint_rel_depth: RelativeDepthPrediction = predictor.__call__(rgb=outpaint_rgb_hw3, K_33=None)
             dpt_conf_mask: Float[np.ndarray, "h w"] = outpaint_rel_depth.confidence
             # convert to boolean mask, depth confidence mask is a binary mask where values > 0 are considered confident
             dpt_conf_mask: Bool[np.ndarray, "H W"] = dpt_conf_mask > 0
@@ -441,7 +533,8 @@ class SingleImagePipeline:
             )
 
             outpaint_rgb_hw3: UInt8[np.ndarray, "H W 3"] = np.array(outpaint_img.convert("RGB"))
-            outpaint_rel_depth: RelativeDepthPrediction = self.predictor.__call__(rgb=outpaint_rgb_hw3, K_33=None)
+            predictor: BaseRelativePredictor = self._get_predictor()
+            outpaint_rel_depth: RelativeDepthPrediction = predictor.__call__(rgb=outpaint_rgb_hw3, K_33=None)
             dpt_conf_mask: Float[np.ndarray, "h w"] = outpaint_rel_depth.confidence
             # convert to boolean mask, depth confidence mask is a binary mask where values > 0 are considered confident
             dpt_conf_mask: Bool[np.ndarray, "H W"] = dpt_conf_mask > 0
@@ -577,6 +670,12 @@ class SingleImagePipeline:
         self.scene: Gaussian_Scene = GS_Train_Tool(self.scene, iters=100)(self.scene.frames, log=False)
 
     def setup_rerun(self):
+        # 显式初始化 rerun,避免隐式 init 在无 GUI 环境里触发 spawn viewer 导致 winit 报错.
+        self.rerun_server_uri = init_rerun_from_config(self.config.rr_config)
+        if self.rerun_server_uri is not None:
+            print(f"[INFO] Rerun gRPC server: {self.rerun_server_uri}")
+            print(f"[INFO] 你可以在本机(有 GUI 的那台机器)执行: rerun --connect {self.rerun_server_uri}")
+
         self.parent_log_path: Path = Path("/world")
         self.final_log_path: Path = Path("/final")
 
@@ -743,3 +842,4 @@ def main(config: SingleImageConfig) -> None:
     minutes: int = int(elapsed // 60)
     seconds: float = elapsed % 60
     print(f"Processing time: {minutes}m {seconds:.2f}s")
+    maybe_wait_after_run(config.rr_config, vd_pipeline.rerun_server_uri)

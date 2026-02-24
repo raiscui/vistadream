@@ -1,5 +1,6 @@
 import os
 import subprocess
+import shutil
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -412,16 +413,29 @@ def save_ply(scene: Gaussian_Scene, path: Path) -> None:
     elements[:] = list(map(tuple, attributes))
     el = PlyElement.describe(elements, "vertex")
     PlyData([el]).write(path)
-    # compress using splat-transform
-    conda_prefix = os.environ.get("CONDA_PREFIX", "")
-    splat_transform_path = Path(conda_prefix) / "bin" / "splat-transform"
+    # -----------------------------
+    # 可选压缩: splat-transform
+    # -----------------------------
+    # 说明:
+    # - 原始 PLY 已经写出,压缩只是额外优化(更小/更快).
+    # - 在 pixi/conda/系统环境下,可执行文件的位置可能不同.
+    # - 因此这里优先用 `shutil.which` 查找,找不到就跳过并提示.
+    splat_transform_bin: str | None = shutil.which("splat-transform")
+    if splat_transform_bin is None:
+        conda_prefix = os.environ.get("CONDA_PREFIX")
+        if conda_prefix:
+            candidate = Path(conda_prefix) / "bin" / "splat-transform"
+            if candidate.exists():
+                splat_transform_bin = str(candidate)
 
-    # Convert to compressed PLY
+    if splat_transform_bin is None:
+        print(f"[INFO] `splat-transform` not found, skip PLY compression. Raw PLY saved at: {path}")
+        return
+
     compressed_path: Path = path.parent / f"{path.stem}.compressed.ply"
-    cmd = [str(splat_transform_path), "-w", str(path), str(compressed_path)]
-    try:
-        process = subprocess.run(cmd, capture_output=True, text=True)
-        if process.returncode != 0:
-            raise RuntimeError(f"Failed to compress PLY: {process.stderr}")
-    except Exception as e:
-        print(f"Error during PLY compression: {e}")
+    cmd = [splat_transform_bin, "-w", str(path), str(compressed_path)]
+    process = subprocess.run(cmd, capture_output=True, text=True)
+    if process.returncode != 0:
+        # 不让压缩失败影响主流程,但给出清晰提示,方便用户排查.
+        stderr = (process.stderr or "").strip()
+        print(f"[WARN] Failed to compress PLY via `splat-transform`, skip. stderr: {stderr}")

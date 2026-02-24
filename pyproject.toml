@@ -8,6 +8,8 @@ dependencies = [
     "gradio-rerun>=0.24,<=0.27",
     "rerun-notebook>=0.24.0,<=0.27",
     "einops>=0.8.1,<0.9",
+    # 允许在设置了 SOCKS 代理(例如 ALL_PROXY=socks5://...)的环境中正常 import gradio/httpx
+    "socksio>=1.0.0",
 ]
 
 [build-system]
