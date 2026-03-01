@@ -1,6 +1,6 @@
 import os
-import subprocess
 import shutil
+import subprocess
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -335,12 +335,13 @@ class Gaussian_Scene:
         frame.inpaint = render_msk
         return frame
 
-    def _add_trainable_frame(self, frame: Frame, require_grad: bool = True) -> None:
+    def _add_trainable_frame(self, frame: Frame, require_grad: bool = True) -> Gaussian_Frame:
         # for the init frame, we keep all pixels for finetuning
         self.frames.append(frame)
         gf = Gaussian_Frame(frame, self.device)
         gf._require_grad(require_grad)
         self.gaussian_frames.append(gf)
+        return gf
 
 
 def color2feat(color: Float[Tensor, "n_splats 3"]) -> Float[Tensor, "n_splats 3 16"]:

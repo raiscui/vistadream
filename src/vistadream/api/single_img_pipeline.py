@@ -1,9 +1,9 @@
+import gc
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from timeit import default_timer as timer
 from typing import Literal
-import gc
 
 import numpy as np
 import rerun as rr
@@ -27,8 +27,8 @@ from vistadream.ops.flux import FluxInpainting, FluxInpaintingConfig
 from vistadream.ops.gs.basic import Frame, Gaussian_Scene, save_ply
 from vistadream.ops.gs.train import GS_Train_Tool
 from vistadream.ops.trajs import _generate_trajectory
-from vistadream.resize_utils import add_border_and_mask, process_image
 from vistadream.rerun_setup import VistaRerunConfig, init_rerun_from_config, maybe_wait_after_run
+from vistadream.resize_utils import add_border_and_mask, process_image
 
 
 def log_frame(parent_log_path: Path, frame: Frame, cam_params: PinholeParameters, log_pcd: bool = False) -> None:
@@ -89,6 +89,47 @@ class SingleImageConfig:
     guidance: float = 30.0
     expansion_percent: float = 0.3
     n_frames: int = 10
+    # coarse 阶段: 为了选帧更稳定,会对轨迹做更密集的采样,采样帧数 = n_frames * coarse_dense_multiplier.
+    # 说明:
+    # - 值越大,候选姿态越多,更容易找到“洞比例合适”的帧.
+    # - 代价是 `_next_frame()` 会更慢,因为它会对每个候选姿态渲染一次 mask 做统计.
+    coarse_dense_multiplier: int = 10
+    # coarse 阶段: pose_to_frame 的额外像素 margin.
+    # 说明:
+    # - 值越大,相机位姿轻微变化也更容易产生洞,从而更容易触发 inpaint 生成新视角.
+    # - 代价是每帧渲染更大,速度更慢,显存压力更高.
+    coarse_margin: int = 32
+    # coarse 选帧阈值: 允许的最大洞(inpaint)比例.
+    # 说明:
+    # - 默认 0.25 比较保守,避免一次 inpaint 过大导致质量下降/失败.
+    # - 你想更激进时可以提高到 0.35/0.45,但需要接受更多的 inpaint 区域与更高的不确定性.
+    coarse_max_inpaint_ratio: float = 0.25
+    # coarse 选帧阈值: 允许的最小洞(inpaint)比例.
+    # 说明:
+    # - 洞太小,即使 inpaint 也不会给高斯带来明显增量,因此默认要求至少 5%.
+    coarse_min_inpaint_ratio: float = 0.05
+    # coarse 选帧策略: 剔除已选帧附近的相邻帧,避免连续帧视角过近.
+    # 说明:
+    # - 默认剔除 ±1 帧.
+    # - 设为 0 可以取消相邻剔除(更激进,但更可能选到相似视角,增量可能更小).
+    coarse_adjacent_exclusion: int = 1
+    # coarse: 是否在结束时打印结构化摘要,用于确认 coarse 是否真的选到了新帧以及新增 splats 数量.
+    coarse_print_summary: bool = True
+    # coarse: 选帧失败时的兜底策略(默认关闭,避免无意中变得“更激进”).
+    # 说明:
+    # - none: 严格遵守 [min,max] 阈值,选不到就停.
+    # - closest: 当严格模式选不到时,从剩余候选里选一个“最接近阈值区间”的帧继续推进.
+    #   这更激进,常用于: (1) 验证 coarse 流程是否真的能补帧; (2) 希望补出更明显几何差异.
+    coarse_fallback_mode: Literal["none", "closest"] = "none"
+    # 相机轨迹参数(影响相机动作幅度,从而影响洞面积与 coarse 是否容易选到新帧).
+    # 说明:
+    # - 这几个参数会写入 `Gaussian_Scene` 并影响 `_generate_trajectory(...)`.
+    # - 想让 coarse 更“动起来”,通常优先调大 `traj_forward_ratio`/`traj_backward_ratio`,
+    #   或放宽 `traj_min_percentage`/`traj_max_percentage` 来增大 radius.
+    traj_forward_ratio: float = 0.3
+    traj_backward_ratio: float = 0.4
+    traj_min_percentage: float = 5.0
+    traj_max_percentage: float = 50.0
     # 说明:
     # - 用于控制输入图片最大边长,越小越省显存.
     # - 建议使用 32 的倍数,否则会在内部被向下对齐到 32 的倍数.
@@ -104,6 +145,25 @@ class SingleImageConfig:
     # - 这里保留同样的默认值,但允许通过 CLI 覆盖.
     # - 如果你传的是目录(没有 .ply 后缀),会自动在目录下补上 `gf.ply`.
     export_gaussians_ply_path: Path = Path("data/test_dir/gf.ply")
+
+
+@dataclass
+class CoarseSelectedFrameStat:
+    """
+    coarse 阶段的选帧统计信息.
+
+    说明:
+    - dense_pose_index: 在 dense trajectory 里的姿态索引(用于定位是轨迹上的哪一帧被选中).
+    - inpaint_ratio: 该姿态下,渲染得到的洞(inpaint mask)面积比例.
+    - inpaint_pixels / inpaint_wo_edge_pixels: 洞区域像素数量,以及去除边缘+低置信后的像素数量.
+    - added_splats: 本帧实际新增到场景里的 splats 数量(以 Gaussian_Frame 过滤后的数量为准).
+    """
+
+    dense_pose_index: int
+    inpaint_ratio: float
+    inpaint_pixels: int
+    inpaint_wo_edge_pixels: int
+    added_splats: int
 
 
 def pose_to_frame(scene: Gaussian_Scene, cam_T_world: Float[np.ndarray, "4 4"], margin: int = 32) -> Frame:
@@ -144,6 +204,203 @@ def pose_to_frame(scene: Gaussian_Scene, cam_T_world: Float[np.ndarray, "4 4"], 
     return rendered_frame
 
 
+def _select_best_pose_index(
+    inpaint_area_ratio_array: Float[np.ndarray, "n_frames"],
+    selected_indices: list[int],
+    *,
+    min_inpaint_ratio: float,
+    max_inpaint_ratio: float,
+    adjacent_exclusion: int,
+    fallback_mode: Literal["none", "closest"] = "none",
+) -> tuple[int, float] | None:
+    """
+    在 dense trajectory 的候选姿态中,选择一个“洞比例合适”的最佳索引.
+
+    说明:
+    - 这是一个纯函数,用于把 coarse 选帧逻辑从渲染/估计流程中解耦出来,便于单测与调参.
+    - 选帧策略: 过滤掉洞比例过大的候选(> max_inpaint_ratio),再剔除已选帧附近的相邻帧,
+      最后在剩余候选里取洞比例最大的那一帧.
+    """
+    if inpaint_area_ratio_array.size == 0:
+        return None
+
+    # 复制一份用于过滤,避免调用方意外复用同一数组导致难以调试.
+    ratios: Float[np.ndarray, "n_frames"] = inpaint_area_ratio_array.astype(np.float32).copy()
+    n_frames: int = int(ratios.shape[0])
+
+    # 先应用 adjacent_exclusion,得到仍可选的索引集合.
+    # 说明:
+    # - 这里用 mask 而不是直接把 ratio 写成 0,这样后续 diagnostics/fallback 更直观.
+    valid_mask: Bool[np.ndarray, "n_frames"] = np.ones((n_frames,), dtype=np.bool_)
+    if adjacent_exclusion < 0:
+        adjacent_exclusion = 0
+    for selected_idx in selected_indices:
+        for offset in range(-adjacent_exclusion, adjacent_exclusion + 1):
+            idx = selected_idx + offset
+            if 0 <= idx < n_frames:
+                valid_mask[idx] = False
+
+    valid_indices: np.ndarray = np.nonzero(valid_mask)[0]
+    if valid_indices.size == 0:
+        return None
+
+    valid_ratios: np.ndarray = ratios[valid_indices]
+
+    # 严格模式: 只在 [min,max] 区间内选,并取 ratio 最大的那一帧.
+    in_range_mask: np.ndarray = (valid_ratios >= float(min_inpaint_ratio)) & (valid_ratios <= float(max_inpaint_ratio))
+    if np.any(in_range_mask):
+        masked: np.ndarray = valid_ratios.copy()
+        masked[~in_range_mask] = -np.inf
+        best_local: int = int(np.argmax(masked))
+        best_idx: int = int(valid_indices[best_local])
+        return best_idx, float(ratios[best_idx])
+
+    if fallback_mode == "none":
+        return None
+
+    # fallback 模式: 选一个“最接近阈值区间”的帧继续推进.
+    # 说明:
+    # - 如果所有候选都 > max,会选 ratio 最小的那一帧(洞相对最小,更稳).
+    # - 如果所有候选都 < min,会选 ratio 最大的那一帧(洞相对最大,更激进).
+    # - 如果两边都有,会选离 [min,max] 最近的那一帧.
+    if fallback_mode != "closest":
+        raise ValueError(f"Unknown fallback_mode={fallback_mode!r}")
+
+    dist_to_band: np.ndarray = np.zeros_like(valid_ratios, dtype=np.float32)
+    dist_to_band[valid_ratios < float(min_inpaint_ratio)] = float(min_inpaint_ratio) - valid_ratios[valid_ratios < float(min_inpaint_ratio)]
+    dist_to_band[valid_ratios > float(max_inpaint_ratio)] = valid_ratios[valid_ratios > float(max_inpaint_ratio)] - float(max_inpaint_ratio)
+    # ratio<=0 代表几乎没有洞,选它没有意义(会浪费一次 inpaint + 深度预测).
+    dist_to_band[valid_ratios <= 0.0] = np.inf
+
+    best_local: int = int(np.argmin(dist_to_band))
+    if not np.isfinite(dist_to_band[best_local]):
+        return None
+    best_idx: int = int(valid_indices[best_local])
+    return best_idx, float(ratios[best_idx])
+
+
+def _print_coarse_frame_selection_diagnostics(
+    inpaint_area_ratio_array: Float[np.ndarray, "n_frames"],
+    selected_indices: list[int],
+    *,
+    min_inpaint_ratio: float,
+    max_inpaint_ratio: float,
+    adjacent_exclusion: int,
+    topk: int = 10,
+) -> None:
+    """
+    coarse 选帧失败时的诊断信息(只打印日志,不改变行为).
+
+    为什么需要它:
+    - 选不到帧通常只有三类原因:
+      1) 洞太小: 所有 ratio < min
+      2) 洞太大: 所有 ratio > max
+      3) 洞在阈值内的帧被 adjacent_exclusion 全部剔除了
+    - 没有分布信息时,用户很难判断应该调 motion 还是调阈值.
+    """
+    if inpaint_area_ratio_array.size == 0:
+        print("[COARSE][DIAG] No candidate poses (empty dense trajectory).")
+        return
+
+    # NOTE: 复制一份,避免上游误复用同一数组导致调参时“看起来数值变了”.
+    ratios: Float[np.ndarray, "n_frames"] = inpaint_area_ratio_array.astype(np.float32).copy()
+    n_frames: int = int(ratios.shape[0])
+
+    # 计算 adjacent_exclusion 后仍然“可用”的候选集合.
+    valid_mask: Bool[np.ndarray, "n_frames"] = np.ones((n_frames,), dtype=np.bool_)
+    if adjacent_exclusion < 0:
+        adjacent_exclusion = 0
+    for selected_idx in selected_indices:
+        for offset in range(-adjacent_exclusion, adjacent_exclusion + 1):
+            idx = selected_idx + offset
+            if 0 <= idx < n_frames:
+                valid_mask[idx] = False
+
+    valid_indices: np.ndarray = np.nonzero(valid_mask)[0]
+    excluded_by_adjacent: int = int(n_frames - valid_indices.shape[0])
+    if valid_indices.size == 0:
+        print(
+            "[COARSE][DIAG] All candidates were excluded by adjacent_exclusion. "
+            f"selected_indices={selected_indices}, adjacent_exclusion={adjacent_exclusion}."
+        )
+        return
+
+    valid_ratios: np.ndarray = ratios[valid_indices]
+
+    # --- 统计分布(用于判断是“太小”还是“太大”) ---
+    min_ratio: float = float(np.min(valid_ratios))
+    mean_ratio: float = float(np.mean(valid_ratios))
+    max_ratio: float = float(np.max(valid_ratios))
+
+    # --- 统计过滤原因(以 valid 候选集合为准) ---
+    below_min_count: int = int(np.sum(valid_ratios < float(min_inpaint_ratio)))
+    above_max_count: int = int(np.sum(valid_ratios > float(max_inpaint_ratio)))
+    in_range_count: int = int(
+        np.sum((valid_ratios >= float(min_inpaint_ratio)) & (valid_ratios <= float(max_inpaint_ratio)))
+    )
+
+    # 同时统计“忽略 adjacent_exclusion 时”的可用数量,用于判断是否是相邻剔除导致失败.
+    in_range_count_without_adj: int = int(
+        np.sum((ratios >= float(min_inpaint_ratio)) & (ratios <= float(max_inpaint_ratio)))
+    )
+
+    print(
+        "[COARSE][DIAG] inpaint_ratio(valid) stats: "
+        f"min={min_ratio:.3f}, mean={mean_ratio:.3f}, max={max_ratio:.3f} "
+        f"(n_valid={valid_indices.size}, excluded_by_adjacent={excluded_by_adjacent})."
+    )
+    print(
+        "[COARSE][DIAG] counts(valid): "
+        f"below_min={below_min_count}, in_range={in_range_count}, above_max={above_max_count} "
+        f"(in_range_without_adj={in_range_count_without_adj})."
+    )
+
+    # Top-K 候选,帮助快速定位“轨迹上哪一段最有洞”.
+    k: int = int(min(int(topk), int(valid_indices.size)))
+    if k > 0:
+        order: np.ndarray = np.argsort(valid_ratios)[::-1]  # descending
+        top_local: np.ndarray = order[:k]
+        top_pairs = [(int(valid_indices[i]), float(valid_ratios[i])) for i in top_local]
+        top_str: str = ", ".join([f"{idx}:{ratio:.3f}" for idx, ratio in top_pairs])
+        print(f"[COARSE][DIAG] top{int(k)}(idx:ratio)={top_str}")
+
+    # --- 调参建议(尽量给出可执行方向,避免误导) ---
+    if in_range_count > 0:
+        # 理论上这种情况下不该失败(应该能选到 max ratio),但仍保留提示,便于未来排查.
+        print(
+            "[COARSE][DIAG] Unexpected: there are in-range candidates but selection still failed. "
+            "If this persists, please report with logs."
+        )
+        return
+
+    if in_range_count_without_adj > 0 and excluded_by_adjacent > 0:
+        print(
+            "[COARSE][DIAG] Likely blocked by adjacent_exclusion. "
+            "Try `--coarse-adjacent-exclusion 0` or increase dense sampling (coarse_dense_multiplier)."
+        )
+        return
+
+    if max_ratio < float(min_inpaint_ratio):
+        print(
+            "[COARSE][DIAG] Holes are too small (< min). "
+            "Try increasing motion (`--traj-forward-ratio/--traj-backward-ratio`, `--traj-max-percentage`), "
+            "increasing `--coarse-margin`, or lowering `--coarse-min-inpaint-ratio`."
+        )
+        return
+
+    if min_ratio > float(max_inpaint_ratio):
+        print(
+            "[COARSE][DIAG] Holes are too large (> max). "
+            "Try increasing `--coarse-max-inpaint-ratio`, or reducing motion/margin."
+        )
+        return
+
+    print(
+        "[COARSE][DIAG] No candidate fell into the [min,max] band. "
+        "Consider widening thresholds or adjusting motion so hole ratios land in-range."
+    )
+
+
 class SingleImagePipeline:
     """
     Pipeline for Flux Outpainting using VistaDream.
@@ -152,6 +409,13 @@ class SingleImagePipeline:
     def __init__(self, config: SingleImageConfig):
         self.config: SingleImageConfig = config
         self.scene: Gaussian_Scene = Gaussian_Scene()
+        # 将 CLI 暴露的轨迹参数写回 scene,确保 coarse 选帧与最终渲染使用一致的相机动作幅度.
+        # 说明:
+        # - 这些参数本质上会影响 trajectory 的半径/前后摆动幅度,从而影响洞(inpaint mask)大小与选帧成功率.
+        self.scene.traj_forward_ratio = float(self.config.traj_forward_ratio)
+        self.scene.traj_backward_ratio = float(self.config.traj_backward_ratio)
+        self.scene.traj_min_percentage = float(self.config.traj_min_percentage)
+        self.scene.traj_max_percentage = float(self.config.traj_max_percentage)
         if self.config.stage in ["outpaint", "coarse", "fine"]:
             self.flux_inpainter: FluxInpainting = FluxInpainting(FluxInpaintingConfig())
         # 注意:
@@ -259,12 +523,20 @@ class SingleImagePipeline:
         Generate coarse scene by iteratively adding frames with good inpainting areas.
         """
         # Generate dense trajectory for frame selection
-        nframes: int = self.config.n_frames * 10  # Dense trajectory for selection
-        dense_cam_T_world_traj: Float[np.ndarray, "n_frames 4 4"] = _generate_trajectory(self.scene, nframes=nframes)
+        dense_multiplier: int = int(self.config.coarse_dense_multiplier)
+        if dense_multiplier <= 0:
+            dense_multiplier = 10
+        dense_nframes: int = int(self.config.n_frames) * dense_multiplier  # Dense trajectory for selection
+        dense_cam_T_world_traj: Float[np.ndarray, "n_frames 4 4"] = _generate_trajectory(
+            self.scene, nframes=dense_nframes
+        )
 
         # Track selected frame indices to avoid adjacent selections
         select_frames: list[int] = []
-        margin: int = 32
+        margin: int = int(self.config.coarse_margin)
+        if margin < 0:
+            margin = 0
+        coarse_stats: list[CoarseSelectedFrameStat] = []
 
         print(f"[INFO] Generating coarse scene with up to {self.config.n_frames} frames...")
 
@@ -273,10 +545,19 @@ class SingleImagePipeline:
             print(f"[INFO] Processing frame {frame_idx + 3}/{self.config.n_frames}...")
 
             # Find next best frame for inpainting
-            next_frame: Frame | None = self._next_frame(dense_cam_T_world_traj, select_frames, margin)
-            if next_frame is None:
+            next_frame_result = self._next_frame(
+                dense_cam_T_world_traj=dense_cam_T_world_traj,
+                select_frames=select_frames,
+                margin=margin,
+                min_inpaint_ratio=float(self.config.coarse_min_inpaint_ratio),
+                max_inpaint_ratio=float(self.config.coarse_max_inpaint_ratio),
+                adjacent_exclusion=int(self.config.coarse_adjacent_exclusion),
+                fallback_mode=str(self.config.coarse_fallback_mode),
+            )
+            if next_frame_result is None:
                 print("[INFO] No more suitable frames found for inpainting")
                 break
+            next_frame, dense_pose_index, inpaint_ratio = next_frame_result
 
             # Update logged camera list for blueprint
             cam_idx: int = len(self.scene.frames) + 2  # +2 for input and outpaint frames
@@ -295,23 +576,79 @@ class SingleImagePipeline:
             log_frame(self.parent_log_path, inpainted_frame, cam_params)
 
             # Add frame to scene and optimize
-            self.scene._add_trainable_frame(inpainted_frame, require_grad=True)
+            gf = self.scene._add_trainable_frame(inpainted_frame, require_grad=True)
+            # 记录本帧新增的统计信息,用于确认 coarse 是否真的“补进”了新视角.
+            inpaint_pixels: int = int(np.sum(inpainted_frame.inpaint))
+            inpaint_wo_edge_pixels: int = int(np.sum(inpainted_frame.inpaint_wo_edge))
+            added_splats: int = int(gf.xyz.shape[0])
+            coarse_stats.append(
+                CoarseSelectedFrameStat(
+                    dense_pose_index=dense_pose_index,
+                    inpaint_ratio=float(inpaint_ratio),
+                    inpaint_pixels=inpaint_pixels,
+                    inpaint_wo_edge_pixels=inpaint_wo_edge_pixels,
+                    added_splats=added_splats,
+                )
+            )
             self.scene: Gaussian_Scene = GS_Train_Tool(self.scene, iters=500)(self.scene.frames, log=False)
             rr.send_blueprint(blueprint=self._create_blueprint(tab_idx=1))
 
+        # coarse 阶段结束后打印一份摘要,让用户不用肉眼猜“到底有没有选到新帧”.
+        if self.config.coarse_print_summary:
+            target_extra_frames: int = max(int(self.config.n_frames) - 2, 0)
+            print("[COARSE] ==================== Summary ====================")
+            print(
+                "[COARSE] "
+                f"selected_extra_frames={len(coarse_stats)}/{target_extra_frames}, "
+                f"dense_nframes={dense_nframes}, "
+                f"margin={margin}, "
+                f"min_inpaint_ratio={self.config.coarse_min_inpaint_ratio}, "
+                f"max_inpaint_ratio={self.config.coarse_max_inpaint_ratio}, "
+                f"adjacent_exclusion={self.config.coarse_adjacent_exclusion}, "
+                f"fallback_mode={self.config.coarse_fallback_mode}"
+            )
+            if not coarse_stats:
+                print("[COARSE] No extra frames were selected. Consider loosening thresholds or increasing motion.")
+            for i, stat in enumerate(coarse_stats, start=1):
+                print(
+                    "[COARSE] "
+                    f"{i:02d}. dense_pose_index={stat.dense_pose_index}, "
+                    f"inpaint_ratio={stat.inpaint_ratio:.3f}, "
+                    f"inpaint_pixels={stat.inpaint_pixels}, "
+                    f"inpaint_wo_edge_pixels={stat.inpaint_wo_edge_pixels}, "
+                    f"added_splats={stat.added_splats}"
+                )
+            total_splats: int = int(sum(int(gf.xyz.shape[0]) for gf in self.scene.gaussian_frames))
+            print(
+                "[COARSE] "
+                f"scene_frames={len(self.scene.frames)}, gaussian_frames={len(self.scene.gaussian_frames)}, total_splats={total_splats}"
+            )
+            print("[COARSE] =================================================")
+
     def _next_frame(
-        self, dense_cam_T_world_traj: Float[np.ndarray, "n_frames 4 4"], select_frames: list[int], margin: int = 32
-    ) -> Frame | None:
+        self,
+        dense_cam_T_world_traj: Float[np.ndarray, "n_frames 4 4"],
+        select_frames: list[int],
+        margin: int = 32,
+        *,
+        min_inpaint_ratio: float = 0.05,
+        max_inpaint_ratio: float = 0.25,
+        adjacent_exclusion: int = 1,
+        fallback_mode: Literal["none", "closest"] = "none",
+    ) -> tuple[Frame, int, float] | None:
         """
-        Select the frame with largest inpaint holes but less than 60% of the image.
+        Select the frame with largest inpaint holes while staying within ratio thresholds.
 
         Args:
             dense_cam_T_world_traj: Dense trajectory of camera poses
             select_frames: List of already selected frame indices
             margin: Margin for frame expansion
+            min_inpaint_ratio: Minimum inpainting area ratio required to consider a frame suitable
+            max_inpaint_ratio: Maximum allowed inpainting area ratio (too-large holes are filtered out)
+            adjacent_exclusion: Exclude poses within ±N of already selected indices
 
         Returns:
-            Frame object ready for inpainting, or None if no suitable frame found
+            (Frame, dense_pose_index, inpaint_ratio), or None if no suitable frame found
         """
         # Calculate inpaint area ratio for each pose
         inpaint_area_ratios: list[float] = []
@@ -323,36 +660,38 @@ class SingleImagePipeline:
             inpaint_area_ratios.append(inpaint_ratio)
 
         inpaint_area_ratio_array: Float[np.ndarray, "n_frames"] = np.array(inpaint_area_ratios, dtype=np.float32)
-
-        # Filter out frames with too much inpainting (> 25%)
-        inpaint_area_ratio_array[inpaint_area_ratio_array > 0.25] = 0.0
-
-        # Remove adjacent frames to already selected ones
-        for selected_idx in select_frames:
-            inpaint_area_ratio_array[selected_idx] = 0.0
-            if selected_idx - 1 >= 0:
-                inpaint_area_ratio_array[selected_idx - 1] = 0.0
-            if selected_idx + 1 < len(dense_cam_T_world_traj):
-                inpaint_area_ratio_array[selected_idx + 1] = 0.0
-
-        # Select frame with largest inpaint area
-        best_frame_idx: int = int(np.argmax(inpaint_area_ratio_array))
-        best_inpaint_ratio: float = float(inpaint_area_ratio_array[best_frame_idx])
-
-        # Minimum inpainting area ratio required to consider a frame suitable
-        min_inpaint_ratio: float = 0.05
-        # Check if we found a suitable frame (at least min_inpaint_ratio inpainting area)
-        if best_inpaint_ratio < min_inpaint_ratio:
+        selected = _select_best_pose_index(
+            inpaint_area_ratio_array,
+            select_frames,
+            min_inpaint_ratio=min_inpaint_ratio,
+            max_inpaint_ratio=max_inpaint_ratio,
+            adjacent_exclusion=adjacent_exclusion,
+            fallback_mode=fallback_mode,
+        )
+        if selected is None:
+            _print_coarse_frame_selection_diagnostics(
+                inpaint_area_ratio_array,
+                select_frames,
+                min_inpaint_ratio=min_inpaint_ratio,
+                max_inpaint_ratio=max_inpaint_ratio,
+                adjacent_exclusion=adjacent_exclusion,
+            )
             return None
+        best_frame_idx, best_inpaint_ratio = selected
 
         # Add to selected frames and return the frame
         select_frames.append(best_frame_idx)
         selected_pose: Float[np.ndarray, "4 4"] = dense_cam_T_world_traj[best_frame_idx]
         selected_frame: Frame = pose_to_frame(self.scene, selected_pose, margin)
 
-        print(f"[INFO] Selected frame {best_frame_idx} with inpaint ratio: {best_inpaint_ratio:.3f}")
+        extra_note: str = ""
+        if fallback_mode != "none" and (
+            best_inpaint_ratio < float(min_inpaint_ratio) or best_inpaint_ratio > float(max_inpaint_ratio)
+        ):
+            extra_note = f" (fallback_mode={fallback_mode})"
+        print(f"[INFO] Selected frame {best_frame_idx} with inpaint ratio: {best_inpaint_ratio:.3f}{extra_note}")
 
-        return selected_frame
+        return selected_frame, best_frame_idx, best_inpaint_ratio
 
     def _inpaint_next_frame(self, frame: Frame) -> Frame:
         """

@@ -10,6 +10,19 @@ This document explains the `single_img_pipeline` in `src/vistadream/api/single_i
   - Initialize and iteratively grow a Gaussian scene with trainable splats
   - Render intermediate and final results, while logging to Rerun
 
+## Stages (`--stage`)
+The single-image CLI supports four stages. The key practical difference is whether coarse expansion runs and adds extra inpainted views into the final Gaussian scene (PLY).
+
+- `no-outpaint` (default): Skip Flux. Only build the input frame (no extra border canvas). Exports a PLY built from a single supervised view.
+- `outpaint`: Run Flux outpainting once to expand the border, then initialize the Gaussian scene from two views: `input` + `outpaint`. No coarse expansion.
+- `fine`: Currently equivalent to `outpaint` in this repo (initialization only; no coarse expansion).
+- `coarse`: Run `outpaint` initialization first, then iteratively:
+  1) propose a camera motion pose, 2) render a hole mask, 3) pick a good pose, 4) RGBD inpaint, 5) add/train new splats.
+
+If `--stage coarse` ends up selecting **zero** extra frames (see `[COARSE] Summary`), the exported PLY will look almost the same as `outpaint/fine` because the pipeline never added new views.
+
+See also: [`docs/coarse_stage_guide.md`](coarse_stage_guide.md) (coarse frame selection diagnostics and tuning guide).
+
 ## Key Components
 - `SingleImagePipeline`: Orchestration class coordinating the whole flow.
 - `FluxInpainting`: Wrapper around Flux-Dev-Fill model for image inpainting.
@@ -83,24 +96,69 @@ flowchart TD
   - `inpaint_wo_edge` = ¬edges ∧ `dpt_conf_mask` (restricted to ROI)
 - Log both frames to Rerun and bootstrap the `Gaussian_Scene` by adding the two frames and running `GS_Train_Tool` for 100 iterations.
 
-Note on training logic: `inpaint=True` means “supervise this pixel.” For the input view we set all pixels to `True` to force perfect reproduction of original content. For the outpaint view, we supervise only the new regions.
+Note on training logic: `inpaint=True` means "supervise this pixel." For the input view we set all pixels to `True` to force perfect reproduction of original content. For the outpaint view, we supervise only the new regions.
 
 ## Coarse Expansion (`_coarse`)
-- Generate a dense trajectory: `_generate_trajectory(scene, nframes = n_frames*10)` using `scene.traj_type` (default spiral).
+- Generate a dense trajectory: `_generate_trajectory(scene, nframes = n_frames * coarse_dense_multiplier)` using `scene.traj_type` (default spiral).
 - Score each candidate pose by rendering with `scene._render_for_inpaint(frame)` and measuring the fraction of `inpaint=True`.
-- Selection policy:
-  - Discard frames with inpaint area > 25%
-  - Enforce non-adjacency to avoid near-duplicates
-  - Require minimum inpaint area ≥ 5%
-  - Pick the best remaining frame and append its index to `logged_cam_idx_list` for UI
+- Selection policy (configurable; defaults shown):
+  - `coarse_max_inpaint_ratio=0.25`: discard poses with inpaint ratio > max
+  - `coarse_min_inpaint_ratio=0.05`: require inpaint ratio ≥ min
+  - `coarse_adjacent_exclusion=1`: exclude poses within ±N of already-selected indices (avoid near-duplicates)
+  - Pick the remaining pose with the largest inpaint ratio
+  - Optional fallback: `coarse_fallback_mode=closest` can pick a "closest-to-band" pose even if no candidate falls into `[min,max]`
 - For each selected pose:
   - Create a `Frame` via `pose_to_frame` (optionally expanded by `margin`)
   - Run `FluxInpainting` on its `inpaint` area
   - Predict depth for the inpainted RGB
-  - Align predicted depth to the frame’s original rendered depth using `Smooth_Connect_Tool._affine_dpt_to_GS` (coarse scale/shift + smooth refinement) and recompute masks:
+  - Align predicted depth to the frame's original rendered depth using `Smooth_Connect_Tool._affine_dpt_to_GS` (coarse scale/shift + smooth refinement) and recompute masks:
     - `inpaint_wo_edge` = `inpaint` ∧ ¬`depth_edges_mask(aligned_dpt)` ∧ `dpt_conf_mask`
   - Log to Rerun, add to `Gaussian_Scene`, and run `GS_Train_Tool` for 500 iterations
-  - Update the blueprint tab to “Coarse Scene”
+  - Update the blueprint tab to "Coarse Scene"
+
+### Coarse Summary and Selection Diagnostics
+Coarse selection has two layers of "don't guess" logging:
+
+1) A final summary (enabled by default via `coarse_print_summary=True`), which answers: "Did coarse actually select new frames, and how many splats were added?"
+
+- `selected_extra_frames=X/Y`: how many extra views were successfully selected and added
+- Per-frame stats:
+  - `dense_pose_index`: where the pose comes from in the dense trajectory
+  - `inpaint_ratio` / `inpaint_pixels`: hole size before filtering
+  - `inpaint_wo_edge_pixels`: pixels that survive the edge + confidence filtering (this is what actually becomes new splats)
+  - `added_splats`: how many splats this frame contributed after filtering
+- Scene totals:
+  - `scene_frames`, `gaussian_frames`, `total_splats`
+
+2) A failure diagnostic (printed only when selection fails), prefixed with `[COARSE][DIAG]`, which tells you *why* no frame was selected:
+- `inpaint_ratio(valid) stats: min/mean/max`
+- `counts(valid): below_min / in_range / above_max (in_range_without_adj=...)`
+- `topK(idx:ratio)=...` to show where the "most hole" part of the trajectory is
+
+Use these numbers to decide whether you should change motion, thresholds, or adjacency exclusion (see tuning below).
+
+### Tuning Guide (Make Coarse More "Aggressive")
+If you see `selected_extra_frames=0` in the summary, coarse effectively degraded to initialization-only. Use the diagnostic hint to pick the right knob:
+
+- Holes are too small (`max < coarse_min_inpaint_ratio`):
+  - Increase camera motion: `--traj-forward-ratio`, `--traj-backward-ratio`, and/or widen `--traj-max-percentage`
+  - Increase render margin: `--coarse-margin`
+  - Or lower the minimum: `--coarse-min-inpaint-ratio`
+
+- Holes are too large (`min > coarse_max_inpaint_ratio`):
+  - Increase the maximum: `--coarse-max-inpaint-ratio`
+  - Or reduce motion / reduce margin
+
+- Blocked by adjacency exclusion (`in_range_without_adj > 0` but `in_range=0`):
+  - Set `--coarse-adjacent-exclusion 0`
+  - Or increase dense sampling: `--coarse-dense-multiplier` (slower, but increases the chance of landing in-band)
+
+If you want a single "force it to pick something" switch for experimentation and PLY-difference amplification:
+- Use `--coarse-fallback-mode closest`.
+  - When strict selection finds no in-range candidate, it will pick a pose closest to the `[min,max]` band and continue.
+  - The log line for the selected frame will include `(fallback_mode=closest)` if the chosen ratio is out of range.
+
+Note: increasing `coarse_dense_multiplier` can significantly slow down coarse selection because it renders every candidate pose to measure the inpaint mask ratio.
 
 ### Frame Selection Logic
 ```mermaid
@@ -113,8 +171,9 @@ sequenceDiagram
     SC->>Traj: Make dense cam_T_world traj
     Sel->>SC: pose_to_frame(cam_T_world, margin)
     Sel->>Sel: inpaint_ratio = mean(mask)
-    Sel->>Sel: Filter: ratio <= 0.25, non-adjacent
-    Sel->>Sel: Require ratio >= 0.05
+    Sel->>Sel: Filter: ratio <= coarse_max_inpaint_ratio, non-adjacent
+    Sel->>Sel: Require ratio >= coarse_min_inpaint_ratio
+    Sel->>Sel: Optional fallback: coarse_fallback_mode=closest
     Sel-->>SC: Return best next Frame
     SC->>Flux: Inpaint selected Frame RGB
     SC->>Pred: Predict depth on inpainted RGB
@@ -134,18 +193,34 @@ sequenceDiagram
 - Orientation-aware layout: adjusts column shares for portrait vs. landscape input.
 
 ## Important Implementation Notes
-- Depth reuse: Only one depth pass is computed (on the outpainted image). The input’s depth and masks are cropped from that result, saving compute and ensuring consistent scaling.
+- Depth reuse: Only one depth pass is computed (on the outpainted image). The input's depth and masks are cropped from that result, saving compute and ensuring consistent scaling.
 - Intrinsics handling: Predictor `K_33` is reused but principal point is recentered for the cropped input frame.
-- Mask semantics: `inpaint=True` means “supervise” in training, not “needs synthetic content now.” This is why the input frame sets it to all `True`.
+- Mask semantics: `inpaint=True` means "supervise" in training, not "needs synthetic content now." This is why the input frame sets it to all `True`.
 - Depth alignment: `Smooth_Connect_Tool` first finds a scale/shift to match rendered depth, then smooths differences at the inpaint boundary by iterative blurring, preventing seams.
 - Image shape constraints: The pipeline relies on `process_image` to ensure sizes compatible with model/grid constraints (multiples-of-32 rule).
 
 ## Entrypoints and Usage
 - Pipeline module: `src/vistadream/api/single_img_pipeline.py`
-- CLI: `tools/run_vistadream.py` (full pipeline) or `tools/run_single_img.py` (if present)
+- CLI: `tools/run_single_img.py` (single-image pipeline) or `tools/run_vistadream.py` (full pipeline)
 - Quick run example:
   - `pixi run example`
   - Or: `pixi run python tools/run_vistadream.py --image-path <img> --n-frames 10 --expansion-percent 0.2`
+
+### Practical CLI Examples
+- Initialization-only (no Flux outpaint):
+  - `pixi run python tools/run_single_img.py --image-path data/office/IMG_4029.jpg --stage no-outpaint`
+
+- Initialization-only with outpainting (same behavior for `outpaint` and `fine` in this repo):
+  - `pixi run python tools/run_single_img.py --image-path data/office/IMG_4029.jpg --stage outpaint`
+  - `pixi run python tools/run_single_img.py --image-path data/office/IMG_4029.jpg --stage fine`
+
+- Coarse expansion (adds extra inpainted views when selection succeeds):
+  - `pixi run python tools/run_single_img.py --image-path data/office/IMG_4029.jpg --stage coarse --export-gaussians-ply-path data/coarse`
+
+- Coarse expansion with a "force pick something" fallback (more aggressive):
+  - `pixi run python tools/run_single_img.py --image-path data/office/IMG_4029.jpg --stage coarse --coarse-fallback-mode closest --export-gaussians-ply-path data/coarse`
+
+Note: if `--export-gaussians-ply-path` is a directory (no `.ply` suffix), the pipeline writes `gf.ply` inside that directory.
 
 ```mermaid
 classDiagram
@@ -185,4 +260,4 @@ classDiagram
 ```
 
 ---
-If you want, I can add a minimal CLI doc snippet linking the config flags to the stages above, or extend this with a troubleshooting section (common pitfalls and expected visuals per tab).
+Suggested next additions (if needed): add a dedicated troubleshooting page with example `[COARSE] Summary` and `[COARSE][DIAG]` logs from real runs, plus recommended parameter presets for "small motion indoor" vs "large motion outdoor" scenes.

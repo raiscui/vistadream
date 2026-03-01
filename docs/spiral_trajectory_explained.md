@@ -3,6 +3,15 @@
 ## Overview
 The Spiral trajectory generates camera movement paths for 3D scene visualization. It creates a smooth spiral motion around the scene center, with various parameters controlling the movement characteristics.
 
+### CLI Mapping (Single-Image Pipeline)
+In `tools/run_single_img.py` (single-image CLI), the spiral-related scene parameters are exposed as:
+- `--traj-forward-ratio` / `--traj-backward-ratio`
+- `--traj-min-percentage` / `--traj-max-percentage`
+
+These values are written into `Gaussian_Scene` before trajectory generation, so they affect both:
+1) the final rendered camera path, and
+2) `--stage coarse` frame selection success (larger motion often increases `inpaint_ratio`, which can make coarse easier or harder to select frames depending on thresholds).
+
 ## Core Parameters
 
 ### 1. Radius Calculation Parameters

@@ -1,4 +1,14 @@
 {
     "python-envs.defaultEnvManager": "ms-python.python:system",
-    "python-envs.pythonProjects": []
+    "python-envs.pythonProjects": [],
+    "workbench.colorCustomizations": {
+        "activityBar.activeBackground": "#9e35e9",
+        "activityBar.background": "#9e35e9",
+        "activityBar.foreground": "#e7e7e7",
+        "activityBar.inactiveForeground": "#e7e7e799",
+        "activityBarBadge.background": "#e69119",
+        "activityBarBadge.foreground": "#15202b",
+        "sash.hoverBorder": "#9e35e9"
+    },
+    "peacock.remoteColor": "#8517d4"
 }

@@ -40,3 +40,10 @@
 - CUDA 12.x GPU recommended; offload CPU → GPU → process → CPU; call `torch.cuda.empty_cache()` after transfers.
 - Checkpoints live under `ckpt/` (via `huggingface-cli`); do not commit weights or large data.
 
+## OpenSpec Workflow (Optional)
+- Run OpenSpec CLI without global installs: `pixi run -e dev corepack pnpm dlx @fission-ai/openspec <cmd>`
+- Common commands:
+  - Status: `... status --change <change-name>`
+  - Instructions: `... instructions <artifact-id> --change <change-name> --json`
+  - Validate: `... validate <change-name> --type change --strict`
+- Disable telemetry (if desired): set env `OPENSPEC_TELEMETRY=0`
